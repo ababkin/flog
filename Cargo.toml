@@ -1,0 +1,14 @@
+[package]
+name = "flog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", features = ["json", "multipart", "blocking"] }
+serde = { version = "1.0", features = ["derive"] }
+tracing = { version = "0.1.40" }
+tracing-core = "0.1"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt", "default"] }
+
+

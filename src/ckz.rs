@@ -62,6 +62,7 @@ struct LogEntry {
 pub struct CkzLayer {
     sender: SyncSender<LogEntry>,
     deployment_id: String,
+    source: String,
 }
 
 impl CkzLayer {
@@ -69,6 +70,7 @@ impl CkzLayer {
         let (sender, receiver) = mpsc::sync_channel(config.buffer_size);
         let endpoint = config.url.to_string();
         let deployment_id = env::var("DEPLOYMENT_ID").expect("DEPLOYMENT_ID must be set");
+        let source = env::var("CKZ_LOG_SOURCE").expect("CKZ_LOG_SOURCE must be set");
         
         // Clone the config to move it into the thread
         let config_clone = config.clone();
@@ -78,7 +80,7 @@ impl CkzLayer {
             process_logs(client, receiver, endpoint, config_clone);
         });
 
-        CkzLayer { sender, deployment_id }
+        CkzLayer { sender, deployment_id, source }
     }
 }
 impl<S> Layer<S> for CkzLayer
@@ -97,7 +99,8 @@ where
 
         let log_entry = LogEntry {
             timestamp,
-            deployment_id: self.deployment_id.clone(),
+            // TODO: make this nicer
+            deployment_id: format!("{}__{}", self.deployment_id, self.source),
             log_level: metadata.level().to_string(),
             message,
             target: metadata.target().to_string(),

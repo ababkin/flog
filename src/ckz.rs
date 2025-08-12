@@ -77,6 +77,12 @@ impl CkzLayer {
         
         thread::spawn(move || {
             let client = Client::new();
+            
+            // Ensure the logs table exists before starting to process logs
+            if let Err(e) = ensure_logs_table_exists(&client, &endpoint) {
+                elog!("ckz", "Failed to ensure logs table exists: {:?}", e);
+            }
+            
             process_logs(client, receiver, endpoint, config_clone);
         });
 
@@ -116,6 +122,69 @@ where
             } else {
                 elog!("ckz", "Failed to send log entry to logging thread: {:?}", e);
             }
+        }
+    }
+}
+
+fn ensure_logs_table_exists(client: &Client, endpoint: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Extract database name from CKZ_DB_NAME environment variable
+    let db_name = env::var("CKZ_DB_NAME").expect("CKZ_DB_NAME must be set");
+    
+    // Extract the base URL from the endpoint (remove the query parameters)
+    let base_url = endpoint.split('?').next().unwrap_or(endpoint);
+    
+    // Create database if it doesn't exist
+    let create_db_query = format!("CREATE DATABASE IF NOT EXISTS {}", db_name);
+    let create_db_url = format!("{}?query={}", base_url, urlencoding::encode(&create_db_query));
+    
+    match client.post(&create_db_url).header("Content-Length", "0").send() {
+        Ok(response) => {
+            if !response.status().is_success() {
+                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+                elog!("ckz", "Failed to create database: {}", error_text);
+                return Err(format!("Failed to create database: {}", error_text).into());
+            }
+        }
+        Err(e) => {
+            elog!("ckz", "Error creating database: {:?}", e);
+            return Err(format!("Error creating database: {:?}", e).into());
+        }
+    }
+    
+    // Create logs table if it doesn't exist
+    let create_table_query = format!(
+        "CREATE TABLE IF NOT EXISTS {}.logs (
+            timestamp DateTime64(9) CODEC(Delta, ZSTD(1)),
+            deployment_id String CODEC(ZSTD(1)),
+            log_level String CODEC(ZSTD(1)),
+            message String CODEC(ZSTD(1)),
+            target String CODEC(ZSTD(1)),
+            file String CODEC(ZSTD(1)),
+            line UInt32 CODEC(Delta, ZSTD(1))
+        ) ENGINE = MergeTree()
+        PARTITION BY (toYYYYMM(timestamp))
+        ORDER BY (timestamp)
+        TTL toDateTime(timestamp) + INTERVAL 6 MONTH
+        SETTINGS index_granularity = 8192",
+        db_name
+    );
+    
+    let create_table_url = format!("{}?query={}", base_url, urlencoding::encode(&create_table_query));
+    
+    match client.post(&create_table_url).header("Content-Length", "0").send() {
+        Ok(response) => {
+            if response.status().is_success() {
+                elog!("ckz", "Successfully ensured logs table exists for database: {}", db_name);
+                Ok(())
+            } else {
+                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
+                elog!("ckz", "Failed to create logs table: {}", error_text);
+                Err(format!("Failed to create logs table: {}", error_text).into())
+            }
+        }
+        Err(e) => {
+            elog!("ckz", "Error creating logs table: {:?}", e);
+            Err(format!("Error creating logs table: {:?}", e).into())
         }
     }
 }

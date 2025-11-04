@@ -7,7 +7,7 @@ use tracing_subscriber::filter::{Targets, LevelFilter};
 pub mod ckz; use ckz::CkzLayer;
 
 const DEFAULT_STDOUT_LOG_LEVEL: &str = "INFO";
-const DEFAULT_CKZ_LOG_LEVEL: &str = "INFO";
+const DEFAULT_CKZ_LOG_LEVEL: &str = "DEBUG";
 
 pub struct LogConfig {
     pub ckz: ckz::Config,

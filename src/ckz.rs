@@ -2,32 +2,32 @@
 CREATE DATABASE IF NOT EXISTS event_server;
 
 CREATE TABLE IF NOT EXISTS event_server.logs (
-	timestamp DateTime64(9) CODEC(Delta, ZSTD(3)),
-	deployment_id String CODEC(ZSTD(3)),
-	log_level String CODEC(ZSTD(3)),
-	message String CODEC(ZSTD(3)),
-	target String CODEC(ZSTD(3)),
-	file String CODEC(ZSTD(3)),
-	line UInt32 CODEC(Delta, ZSTD(3))
+	timestamp Int64,
+	deployment_id String CODEC(ZSTD(1)),
+	log_level String CODEC(ZSTD(1)),
+	message String CODEC(ZSTD(1)),
+	target String CODEC(ZSTD(1)),
+	file String CODEC(ZSTD(1)),
+	line UInt32 CODEC(Delta, ZSTD(1))
 ) ENGINE = MergeTree()
-PARTITION BY (deployment_id, toYYYYMM(timestamp))
-ORDER BY (timestamp, deployment_id)
-TTL toDateTime(timestamp) + INTERVAL 6 MONTH
+PARTITION BY (toYYYYMM(toDateTime(timestamp / 1000000000)))
+ORDER BY (timestamp)
+TTL toDateTime(timestamp / 1000000000) + INTERVAL 6 MONTH
 SETTINGS index_granularity = 8192;
 */
 
-use reqwest::blocking::Client;
-use serde::Serialize;
+use klickhouse::{Client, ClientOptions};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::{layer::Context, Layer, registry::LookupSpan};
 use tracing_core::field::Field;
 use std::fmt::Debug;
-use std::sync::mpsc::{self, SyncSender, Receiver};
-use std::thread;
-use std::time::{ Instant, Duration };
+use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant, MissedTickBehavior};
 use chrono::Utc;
 use chrono::NaiveDateTime;
 use std::env;
+use anyhow::{anyhow, Result};
+use url::Url;
 
 
 #[macro_export]
@@ -48,53 +48,68 @@ pub struct Config {
     pub max_batch_size: usize,
 }
 
-#[derive(Serialize, Debug)]
-struct LogEntry {
-    timestamp: u64,
-    deployment_id: String,
-    log_level: String,
-    message: String,
-    target: String,
-    file: Option<String>,
-    line: Option<u32>,
+#[derive(klickhouse::Row, Debug, Clone)]
+pub struct LogEntry {
+    pub timestamp: i64, // Nanoseconds since epoch
+    pub deployment_id: String,
+    pub log_level: String,
+    pub message: String,
+    pub target: String,
+    pub file: String,
+    pub line: u32,
 }
 
 pub struct CkzLayer {
-    sender: SyncSender<LogEntry>,
+    sender: mpsc::Sender<LogEntry>,
     deployment_id: String,
     source: String,
 }
 
 impl CkzLayer {
     pub fn new(config: Config) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(config.buffer_size);
-        let endpoint = config.url.to_string();
+        let (sender, mut receiver) = mpsc::channel(config.buffer_size);
+        let url = config.url.clone();
         let deployment_id = env::var("DEPLOYMENT_ID").expect("DEPLOYMENT_ID must be set");
         let source = env::var("CKZ_LOG_SOURCE").expect("CKZ_LOG_SOURCE must be set");
         
-        // Clone the config to move it into the thread
+        // Clone the config to move it into the task
         let config_clone = config.clone();
         
-        thread::spawn(move || {
-            let client = Client::new();
+        // Spawn initialization and processing task
+        // The table will be created before we start processing logs, ensuring it exists on startup
+        tokio::spawn(async move {
+            // Create klickhouse client
+            let client = match create_client(&url).await {
+                Ok(client) => client,
+                Err(e) => {
+                    elog!("ckz", "Failed to create ClickHouse client: {:?}", e);
+                    return;
+                }
+            };
             
             // Ensure the logs table exists before starting to process logs
-            if let Err(e) = ensure_logs_table_exists(&client, &endpoint) {
+            // This happens on startup, before any logs are processed
+            if let Err(e) = ensure_logs_table_exists(&client).await {
                 elog!("ckz", "Failed to ensure logs table exists: {:?}", e);
+                // Continue anyway - logs will be buffered and can be retried later
+            } else {
+                elog!("ckz", "Successfully ensured logs table exists");
             }
             
-            process_logs(client, receiver, endpoint, config_clone);
+            // Start processing logs (table is now ready)
+            process_logs(client, &mut receiver, config_clone).await;
         });
 
         CkzLayer { sender, deployment_id, source }
     }
 }
+
 impl<S> Layer<S> for CkzLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event, _ctx: Context<S>) {
-        let timestamp = naive_to_u64(Utc::now().naive_utc());
+        let timestamp = naive_to_i64(Utc::now().naive_utc());
         let metadata = event.metadata();
         let mut message = String::new();
         event.record(&mut |field: &Field, value: &dyn Debug| {
@@ -110,51 +125,84 @@ where
             log_level: metadata.level().to_string(),
             message,
             target: metadata.target().to_string(),
-            file: metadata.file().map(String::from),
-            line: metadata.line(),
+            file: metadata.file().map(String::from).unwrap_or_default(),
+            line: metadata.line().unwrap_or(0),
         };
 
         // Use try_send instead of send to drop logs if the channel is full
         if let Err(e) = self.sender.try_send(log_entry) {
-            if let mpsc::TrySendError::Full(_) = e {
-                // Log entry dropped due to full channel
-                elog!("ckz", "Log entry dropped due to full channel.");
-            } else {
-                elog!("ckz", "Failed to send log entry to logging thread: {:?}", e);
+            match e {
+                tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                    // Log entry dropped due to full channel
+                    elog!("ckz", "Log entry dropped due to full channel.");
+                }
+                tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                    elog!("ckz", "Failed to send log entry to logging task: channel closed");
+                }
             }
         }
     }
 }
 
-fn ensure_logs_table_exists(client: &Client, endpoint: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Extract database name from CKZ_DB_NAME environment variable
+async fn create_client(url: &str) -> Result<Client> {
+    // Parse URL to extract host and port for klickhouse
+    // klickhouse uses native protocol on port 9000, not HTTP on 8123
+    let address = if url.contains("://") {
+        let parsed_url = Url::parse(url).map_err(|e| anyhow!("Invalid URL: {}", e))?;
+        
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| anyhow!("Missing host in URL"))?;
+        
+        // For HTTP URLs, use port 9000 (native protocol) instead of 8123 (HTTP)
+        let port = parsed_url.port().unwrap_or(9000);
+        
+        format!("{}:{}", host, port)
+    } else {
+        // Already in host:port format
+        url.to_string()
+    };
+
+    // Get credentials from environment
+    let username = env::var("CKZ_USER").unwrap_or_else(|_| "default".to_string());
+    let password = env::var("CKZ_PASS").unwrap_or_else(|_| "".to_string());
     let db_name = env::var("CKZ_DB_NAME").expect("CKZ_DB_NAME must be set");
-    
-    // Extract the base URL from the endpoint (remove the query parameters)
-    let base_url = endpoint.split('?').next().unwrap_or(endpoint);
-    
-    // Create database if it doesn't exist
-    let create_db_query = format!("CREATE DATABASE IF NOT EXISTS {}", db_name);
-    let create_db_url = format!("{}?query={}", base_url, urlencoding::encode(&create_db_query));
-    
-    match client.post(&create_db_url).header("Content-Length", "0").send() {
-        Ok(response) => {
-            if !response.status().is_success() {
-                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-                elog!("ckz", "Failed to create database: {}", error_text);
-                return Err(format!("Failed to create database: {}", error_text).into());
-            }
-        }
-        Err(e) => {
-            elog!("ckz", "Error creating database: {:?}", e);
-            return Err(format!("Error creating database: {:?}", e).into());
-        }
-    }
+
+    // First connect without specifying a default database to create the database
+    let mut options = ClientOptions::default();
+    options.username = username.clone();
+    options.password = password.clone();
+    // Don't set default_database yet - connect to 'default' database first
+
+    let client = Client::connect(&address, options)
+        .await
+        .map_err(|e| anyhow!("Failed to connect: {}", e))?;
+
+    // Create the database if it doesn't exist
+    let create_database_sql = format!("CREATE DATABASE IF NOT EXISTS {}", db_name);
+    client
+        .execute(&create_database_sql)
+        .await
+        .map_err(|e| anyhow!("Failed to create database: {}", e))?;
+
+    // Now reconnect with the target database as default
+    let mut options_with_db = ClientOptions::default();
+    options_with_db.username = username;
+    options_with_db.password = password;
+    options_with_db.default_database = db_name;
+
+    Client::connect(&address, options_with_db)
+        .await
+        .map_err(|e| anyhow!("Failed to connect with database: {}", e))
+}
+
+async fn ensure_logs_table_exists(client: &Client) -> Result<()> {
+    let db_name = env::var("CKZ_DB_NAME").expect("CKZ_DB_NAME must be set");
     
     // Create logs table if it doesn't exist
     let create_table_query = format!(
         "CREATE TABLE IF NOT EXISTS {}.logs (
-            timestamp DateTime64(9) CODEC(Delta, ZSTD(1)),
+            timestamp Int64,
             deployment_id String CODEC(ZSTD(1)),
             log_level String CODEC(ZSTD(1)),
             message String CODEC(ZSTD(1)),
@@ -162,89 +210,83 @@ fn ensure_logs_table_exists(client: &Client, endpoint: &str) -> Result<(), Box<d
             file String CODEC(ZSTD(1)),
             line UInt32 CODEC(Delta, ZSTD(1))
         ) ENGINE = MergeTree()
-        PARTITION BY (toYYYYMM(timestamp))
+        PARTITION BY (toYYYYMM(toDateTime(timestamp / 1000000000)))
         ORDER BY (timestamp)
-        TTL toDateTime(timestamp) + INTERVAL 6 MONTH
+        TTL toDateTime(timestamp / 1000000000) + INTERVAL 6 MONTH
         SETTINGS index_granularity = 8192",
         db_name
     );
     
-    let create_table_url = format!("{}?query={}", base_url, urlencoding::encode(&create_table_query));
+    client
+        .execute(&create_table_query)
+        .await
+        .map_err(|e| {
+            elog!("ckz", "Failed to create logs table: {:?}", e);
+            anyhow!("Failed to create logs table: {}", e)
+        })?;
     
-    match client.post(&create_table_url).header("Content-Length", "0").send() {
-        Ok(response) => {
-            if response.status().is_success() {
-                elog!("ckz", "Successfully ensured logs table exists for database: {}", db_name);
-                Ok(())
-            } else {
-                let error_text = response.text().unwrap_or_else(|_| "Unknown error".to_string());
-                elog!("ckz", "Failed to create logs table: {}", error_text);
-                Err(format!("Failed to create logs table: {}", error_text).into())
-            }
-        }
-        Err(e) => {
-            elog!("ckz", "Error creating logs table: {:?}", e);
-            Err(format!("Error creating logs table: {:?}", e).into())
-        }
-    }
+    elog!("ckz", "Successfully ensured logs table exists for database: {}", db_name);
+    Ok(())
 }
 
-fn process_logs(client: Client, receiver: Receiver<LogEntry>, endpoint: String, config: Config) {
+async fn process_logs(client: Client, receiver: &mut mpsc::Receiver<LogEntry>, config: Config) {
     let mut buffer = Vec::new();
     let max_interval = Duration::from_secs(config.flush_interval_secs);
     let mut last_send = Instant::now();
+    
+    // Create a periodic flush interval that fires every 100ms
+    let mut flush_interval = tokio::time::interval(Duration::from_millis(100));
+    flush_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        let entry = receiver.recv_timeout(Duration::from_millis(config.receive_timeout_millis));
-        match entry {
-            Ok(log_entry) => {
-                buffer.push(log_entry);
-                if buffer.len() >= config.max_batch_size || last_send.elapsed() >= max_interval {
-                    send_batch(&client, &endpoint, &mut buffer);
-                    last_send = Instant::now();
+        tokio::select! {
+            // Receive log entries
+            entry = receiver.recv() => {
+                match entry {
+                    Some(log_entry) => {
+                        buffer.push(log_entry);
+                        if buffer.len() >= config.max_batch_size {
+                            send_batch(&client, &mut buffer).await;
+                            last_send = Instant::now();
+                        }
+                    },
+                    None => break, // Channel closed
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            
+            // Periodic flush based on timeout
+            _ = flush_interval.tick() => {
                 if !buffer.is_empty() && last_send.elapsed() >= max_interval {
-                    send_batch(&client, &endpoint, &mut buffer);
+                    send_batch(&client, &mut buffer).await;
                     last_send = Instant::now();
                 }
             },
-            Err(_) => break, // Channel disconnected
         }
     }
 
     // Send remaining logs before exiting
     if !buffer.is_empty() {
-        send_batch(&client, &endpoint, &mut buffer);
+        send_batch(&client, &mut buffer).await;
     }
 }
 
-fn send_batch(client: &Client, endpoint: &str, buffer: &mut Vec<LogEntry>) {
+async fn send_batch(client: &Client, buffer: &mut Vec<LogEntry>) {
     if buffer.is_empty() {
         return;
     }
 
-    // Create a request with a timeout of 10 seconds
-    let request = client
-        .post(endpoint)
-        .json(&buffer)
-        .timeout(Duration::from_secs(10)); // Set the timeout to 10 seconds
+    let records = std::mem::take(buffer);
 
-    match request.send() {
-        Ok(response) => {
-            if response.status().is_success() {
-                // Successfully sent log entries
-                buffer.clear();
-            } else {
-                elog!("ckz", "Failed to send log entries: {:?}", response.text().unwrap_or_else(|_| "Unknown error".to_string()));
-            }
+    // Use INSERT with FORMAT Native via klickhouse::Row derive macro
+    let insert_query = "INSERT INTO logs FORMAT NATIVE";
+    match client.insert_native_block(insert_query, records).await {
+        Ok(()) => {
+            // Successfully sent log entries (suppressed for noise reduction)
         }
         Err(e) => {
-            elog!("ckz", "Error sending log entries (possibly due to timeout): {:?}", e);
-            // Clear the buffer on timeout or any other error, so the channel doesn't overfill and block the upstream stuff
+            elog!("ckz", "Error sending log entries: {:?}", e);
+            // Clear the buffer on error, so the channel doesn't overfill and block the upstream stuff
             // due to bounded channel backpressure
-            buffer.clear();
         }
     }
 }

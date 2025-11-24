@@ -1,20 +1,3 @@
-/*
-CREATE DATABASE IF NOT EXISTS event_server;
-
-CREATE TABLE IF NOT EXISTS event_server.logs (
-	timestamp Int64,
-	deployment_id String CODEC(ZSTD(1)),
-	log_level String CODEC(ZSTD(1)),
-	message String CODEC(ZSTD(1)),
-	target String CODEC(ZSTD(1)),
-	file String CODEC(ZSTD(1)),
-	line UInt32 CODEC(Delta, ZSTD(1))
-) ENGINE = MergeTree()
-PARTITION BY (toYYYYMM(toDateTime(timestamp / 1000000000)))
-ORDER BY (timestamp)
-TTL toDateTime(timestamp / 1000000000) + INTERVAL 6 MONTH
-SETTINGS index_granularity = 8192;
-*/
 
 use klickhouse::{Client, ClientOptions};
 use tracing::{Event, Subscriber};
@@ -154,8 +137,13 @@ async fn create_client(url: &str) -> Result<Client> {
             .host_str()
             .ok_or_else(|| anyhow!("Missing host in URL"))?;
         
-        // For HTTP URLs, use port 9000 (native protocol) instead of 8123 (HTTP)
-        let port = parsed_url.port().unwrap_or(9000);
+        // For HTTP URLs, always use port 9000 (native protocol) instead of 8123 (HTTP)
+        // If the URL specifies port 8123, convert it to 9000 for native protocol
+        let port = match parsed_url.port() {
+            Some(8123) => 9000,  // Convert HTTP port to native protocol port
+            Some(p) => p,         // Use specified port if it's not 8123
+            None => 9000,         // Default to native protocol port
+        };
         
         format!("{}:{}", host, port)
     } else {
@@ -212,7 +200,7 @@ async fn ensure_logs_table_exists(client: &Client) -> Result<()> {
         ) ENGINE = MergeTree()
         PARTITION BY (toYYYYMM(toDateTime(timestamp / 1000000000)))
         ORDER BY (timestamp)
-        TTL toDateTime(timestamp / 1000000000) + INTERVAL 6 MONTH
+        TTL toDateTime(timestamp / 1000000000) + INTERVAL 3 MONTH
         SETTINGS index_granularity = 8192",
         db_name
     );

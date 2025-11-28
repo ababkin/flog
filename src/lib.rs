@@ -1,8 +1,7 @@
-use tracing::Level;
 use tracing_subscriber::{fmt, layer::SubscriberExt, Registry};
 use std::env;
 use tracing_subscriber::layer::Layer;
-use tracing_subscriber::filter::{Targets, LevelFilter};
+use tracing_subscriber::filter::LevelFilter;
 
 pub mod ckz; use ckz::CkzLayer;
 
@@ -15,29 +14,18 @@ pub struct LogConfig {
 
 pub fn setup(config: LogConfig) {
     let stdout_log_level_str = env::var("STDOUT_LOG_LEVEL").unwrap_or_else(|_| DEFAULT_STDOUT_LOG_LEVEL.to_string());
-    let stdout_log_level: Level = stdout_log_level_str.parse().expect("STDOUT_LOG_LEVEL not a string");
+    let stdout_log_level: LevelFilter = stdout_log_level_str.parse().expect("STDOUT_LOG_LEVEL not a string");
 
     let ckz_log_level_str = env::var("CKZ_LOG_LEVEL").unwrap_or_else(|_| DEFAULT_CKZ_LOG_LEVEL.to_string());
     let ckz_log_level: LevelFilter = ckz_log_level_str.parse().expect("CKZ_LOG_LEVEL not a string");
 
-    let common_filter = Targets::new()
-        .with_target("hyper_util", LevelFilter::OFF)
-        .with_target("hyper", LevelFilter::INFO)
-        .with_target("h2", LevelFilter::INFO);
-
-    let stdout_filter = common_filter
-        .clone()
-        .with_target("", stdout_log_level);
-
-    let ckz_filter = common_filter
-        .with_target("", ckz_log_level);
-
+    // Simple filters: just use LevelFilter directly - it matches all targets at the specified level
     let stdout_layer = fmt::Layer::new()
         .with_writer(std::io::stdout)
-        .with_filter(stdout_filter);
+        .with_filter(stdout_log_level);
 
     let ckz_layer = CkzLayer::new(config.ckz)
-        .with_filter(ckz_filter);
+        .with_filter(ckz_log_level);
 
     let subscriber = Registry::default()
         .with(ckz_layer)
